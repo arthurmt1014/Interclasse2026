@@ -1,0 +1,550 @@
+// ============================================================
+// .env.local
+// ============================================================
+// NEXT_PUBLIC_SUPABASE_URL=https://snhcuhrdlpmbebdpfyaf.supabase.co
+// NEXT_PUBLIC_SUPABASE_ANON_KEY=sb_publishable_Q8Ngn8hc06aKmtltbZP7bQ_i9kFTXTF
+
+
+// ============================================================
+// lib/supabase.ts
+// ============================================================
+import { createClient } from '@supabase/supabase-js'
+
+export const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+)
+
+
+// ============================================================
+// lib/types.ts
+// ============================================================
+export interface Team {
+  id: number
+  nome: string
+  turma?: string
+  grupo: number
+  foto_url?: string
+  descricao?: string
+}
+
+export interface Player {
+  id: number
+  nome: string
+  numero: number
+  posicao?: string
+  time_id: number
+  foto_url?: string
+}
+
+export interface Match {
+  id: number
+  time_a: number
+  time_b: number
+  gols_a: number | null
+  gols_b: number | null
+  rodada: number
+  data?: string
+  status: 'agendada' | 'ao_vivo' | 'encerrada'
+}
+
+export interface Goal {
+  id: number
+  match_id: number
+  player_id: number
+  player_name?: string
+  minuto: number
+}
+
+export interface Card {
+  id: number
+  match_id: number
+  player_id: number
+  tipo: 'amarelo' | 'vermelho'
+  minuto: number
+}
+
+export interface KnockoutMatch {
+  id: number
+  fase: 'quartas' | 'semifinal' | 'final'
+  pos: number
+  time_a: number | null
+  time_b: number | null
+  gols_a: number | null
+  gols_b: number | null
+  vencedor: number | null
+}
+
+export interface TeamStats {
+  pts: number
+  j: number
+  v: number
+  e: number
+  d: number
+  gf: number
+  gc: number
+  sg: number
+}
+
+
+// ============================================================
+// lib/standings.ts
+// ============================================================
+import { Match, Team, TeamStats } from './types'
+
+export const BASE_STATS: Record<number, Omit<TeamStats, 'sg'>> = {
+  1:  { pts:10, j:4, v:3, e:1, d:0, gf:15, gc:2  },
+  2:  { pts:9,  j:4, v:3, e:0, d:1, gf:14, gc:3  },
+  3:  { pts:9,  j:4, v:3, e:0, d:1, gf:9,  gc:4  },
+  4:  { pts:9,  j:4, v:3, e:0, d:1, gf:8,  gc:4  },
+  5:  { pts:3,  j:4, v:1, e:0, d:3, gf:4,  gc:5  },
+  6:  { pts:6,  j:4, v:2, e:0, d:2, gf:6,  gc:6  },
+  7:  { pts:12, j:4, v:4, e:0, d:0, gf:22, gc:2  },
+  8:  { pts:6,  j:4, v:2, e:0, d:2, gf:9,  gc:4  },
+  9:  { pts:3,  j:4, v:1, e:0, d:3, gf:2,  gc:15 },
+  10: { pts:3,  j:4, v:1, e:0, d:3, gf:3,  gc:13 },
+  11: { pts:0,  j:4, v:0, e:0, d:4, gf:1,  gc:10 },
+  12: { pts:1,  j:4, v:0, e:1, d:3, gf:2,  gc:17 },
+}
+
+export function calcStandings(
+  teams: Team[],
+  matches: Match[]
+): Record<number, TeamStats> {
+  const s: Record<number, TeamStats> = {}
+
+  teams.forEach(t => {
+    const b = BASE_STATS[t.id] ?? { pts:0, j:0, v:0, e:0, d:0, gf:0, gc:0 }
+    s[t.id] = { ...b, sg: b.gf - b.gc }
+  })
+
+  matches
+    .filter(m => m.status === 'encerrada' && m.gols_a !== null && m.gols_b !== null)
+    .forEach(m => {
+      const a = s[m.time_a], b = s[m.time_b]
+      if (!a || !b) return
+      const ga = Number(m.gols_a), gb = Number(m.gols_b)
+      a.j++; b.j++
+      a.gf += ga; a.gc += gb
+      b.gf += gb; b.gc += ga
+      if (ga > gb)      { a.pts += 3; a.v++; b.d++ }
+      else if (gb > ga) { b.pts += 3; b.v++; a.d++ }
+      else              { a.pts++; a.e++; b.pts++; b.e++ }
+      a.sg = a.gf - a.gc
+      b.sg = b.gf - b.gc
+    })
+
+  return s
+}
+
+
+// ============================================================
+// hooks/useRealtimeTable.ts
+// ============================================================
+import { useEffect, useState, useCallback } from 'react'
+import { supabase } from '@/lib/supabase'
+
+export function useRealtimeTable<T>(table: string) {
+  const [data, setData] = useState<T[]>([])
+  const [loading, setLoading] = useState(true)
+
+  const fetch = useCallback(async () => {
+    const { data: rows } = await supabase.from(table).select('*').order('id')
+    if (rows) setData(rows as T[])
+    setLoading(false)
+  }, [table])
+
+  useEffect(() => {
+    fetch()
+    const channel = supabase
+      .channel(`realtime:${table}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table }, fetch)
+      .subscribe()
+    return () => { supabase.removeChannel(channel) }
+  }, [fetch, table])
+
+  return { data, loading, refetch: fetch }
+}
+
+
+// ============================================================
+// hooks/useTeams.ts
+// ============================================================
+import { useRealtimeTable } from './useRealtimeTable'
+import { supabase } from '@/lib/supabase'
+import { Team } from '@/lib/types'
+
+export function useTeams() {
+  const { data: teams, loading } = useRealtimeTable<Team>('teams')
+
+  const addTeam = async (t: Omit<Team, 'id'>) => {
+    await supabase.from('teams').insert(t)
+  }
+  const updateTeam = async (t: Team) => {
+    const { id, ...rest } = t
+    await supabase.from('teams').update(rest).eq('id', id)
+  }
+  const deleteTeam = async (id: number) => {
+    await supabase.from('teams').delete().eq('id', id)
+  }
+
+  return { teams, loading, addTeam, updateTeam, deleteTeam }
+}
+
+
+// ============================================================
+// hooks/usePlayers.ts
+// ============================================================
+import { useRealtimeTable } from './useRealtimeTable'
+import { supabase } from '@/lib/supabase'
+import { Player } from '@/lib/types'
+
+export function usePlayers() {
+  const { data: players, loading } = useRealtimeTable<Player>('players')
+
+  const addPlayer = async (p: Omit<Player, 'id'>) => {
+    await supabase.from('players').insert(p)
+  }
+  const updatePlayer = async (p: Player) => {
+    const { id, ...rest } = p
+    await supabase.from('players').update(rest).eq('id', id)
+  }
+  const deletePlayer = async (id: number) => {
+    await supabase.from('players').delete().eq('id', id)
+  }
+
+  return { players, loading, addPlayer, updatePlayer, deletePlayer }
+}
+
+
+// ============================================================
+// hooks/useMatches.ts
+// ============================================================
+import { useRealtimeTable } from './useRealtimeTable'
+import { supabase } from '@/lib/supabase'
+import { Match } from '@/lib/types'
+
+export function useMatches() {
+  const { data: matches, loading } = useRealtimeTable<Match>('matches')
+
+  const addMatch = async (m: Omit<Match, 'id'>) => {
+    await supabase.from('matches').insert(m)
+  }
+  const updateMatch = async (m: Match) => {
+    const { id, ...rest } = m
+    await supabase.from('matches').update(rest).eq('id', id)
+  }
+  const deleteMatch = async (id: number) => {
+    await supabase.from('matches').delete().eq('id', id)
+  }
+
+  return { matches, loading, addMatch, updateMatch, deleteMatch }
+}
+
+
+// ============================================================
+// hooks/useGoals.ts
+// ============================================================
+import { useRealtimeTable } from './useRealtimeTable'
+import { supabase } from '@/lib/supabase'
+import { Goal } from '@/lib/types'
+
+export function useGoals() {
+  const { data: goals, loading } = useRealtimeTable<Goal>('goals')
+
+  const addGoal = async (g: Omit<Goal, 'id'>) => {
+    await supabase.from('goals').insert(g)
+  }
+  const deleteGoal = async (id: number) => {
+    await supabase.from('goals').delete().eq('id', id)
+  }
+
+  return { goals, loading, addGoal, deleteGoal }
+}
+
+
+// ============================================================
+// hooks/useCards.ts
+// ============================================================
+import { useRealtimeTable } from './useRealtimeTable'
+import { supabase } from '@/lib/supabase'
+import { Card } from '@/lib/types'
+
+export function useCards() {
+  const { data: cards, loading } = useRealtimeTable<Card>('cards')
+
+  const addCard = async (c: Omit<Card, 'id'>) => {
+    await supabase.from('cards').insert(c)
+  }
+  const deleteCard = async (id: number) => {
+    await supabase.from('cards').delete().eq('id', id)
+  }
+
+  return { cards, loading, addCard, deleteCard }
+}
+
+
+// ============================================================
+// hooks/useKnockout.ts
+// ============================================================
+import { useRealtimeTable } from './useRealtimeTable'
+import { supabase } from '@/lib/supabase'
+import { KnockoutMatch } from '@/lib/types'
+
+export function useKnockout() {
+  const { data: knockout, loading } = useRealtimeTable<KnockoutMatch>('knockout_matches')
+
+  const setKnockout = async (matches: Omit<KnockoutMatch, 'id'>[]) => {
+    await supabase.from('knockout_matches').delete().neq('id', 0)
+    await supabase.from('knockout_matches').insert(matches)
+  }
+  const updateKnockout = async (k: KnockoutMatch) => {
+    const { id, ...rest } = k
+    await supabase.from('knockout_matches').update(rest).eq('id', id)
+  }
+
+  return { knockout, loading, setKnockout, updateKnockout }
+}
+
+
+// ============================================================
+// hooks/useAuth.ts
+// ============================================================
+import { useEffect, useState } from 'react'
+import { supabase } from '@/lib/supabase'
+import type { Session } from '@supabase/supabase-js'
+
+export function useAuth() {
+  const [session, setSession] = useState<Session | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session)
+      setLoading(false)
+    })
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, s) => {
+      setSession(s)
+    })
+    return () => subscription.unsubscribe()
+  }, [])
+
+  const signIn = async (email: string, password: string) => {
+    const { error } = await supabase.auth.signInWithPassword({ email, password })
+    return error
+  }
+
+  const signOut = async () => {
+    await supabase.auth.signOut()
+  }
+
+  return { session, loading, isAdmin: !!session, signIn, signOut }
+}
+
+
+// ============================================================
+// app/login/page.tsx
+// ============================================================
+'use client'
+import { useState } from 'react'
+import { useRouter } from 'next/navigation'
+import { useAuth } from '@/hooks/useAuth'
+
+export default function LoginPage() {
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
+  const { signIn } = useAuth()
+  const router = useRouter()
+
+  const handleLogin = async () => {
+    setLoading(true)
+    setError('')
+    const err = await signIn(email, password)
+    if (err) { setError('Credenciais inválidas.'); setPassword('') }
+    else router.push('/admin')
+    setLoading(false)
+  }
+
+  const C = { bg:'#07111f', card2:'#132540', border:'#1a3060', gold:'#f0b429', muted:'#64748b', text:'#e2e8f0', red:'#dc2626' }
+  const inp = { background:'#0c1a2e', border:`1px solid ${C.border}`, borderRadius:6, color:C.text, fontSize:13, padding:'9px 12px', outline:'none', width:'100%' } as React.CSSProperties
+
+  return (
+    <div style={{ minHeight:'100vh', background:C.bg, display:'flex', alignItems:'center', justifyContent:'center' }}>
+      <div style={{ background:C.card2, border:`1px solid ${C.border}`, borderRadius:14, padding:'34px 30px', width:'100%', maxWidth:360, boxShadow:'0 24px 60px rgba(0,0,0,.6)' }}>
+        <div style={{ textAlign:'center', marginBottom:26 }}>
+          <div style={{ fontSize:36, marginBottom:8 }}>🏆</div>
+          <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:26, letterSpacing:3, color:C.text }}>
+            INTER<span style={{ color:C.gold }}>CLASSE</span> 2026
+          </div>
+          <div style={{ fontSize:10, color:C.muted, letterSpacing:1, marginTop:2 }}>PAINEL ADMINISTRATIVO</div>
+        </div>
+        <label style={{ display:'block', fontSize:10, fontWeight:700, letterSpacing:1.2, textTransform:'uppercase', color:C.muted, marginBottom:5 }}>Email</label>
+        <input value={email} onChange={e => setEmail(e.target.value)} placeholder="admin@interclasse.com" onKeyDown={e => e.key === 'Enter' && handleLogin()} style={{ ...inp, marginBottom:14 }} />
+        <label style={{ display:'block', fontSize:10, fontWeight:700, letterSpacing:1.2, textTransform:'uppercase', color:C.muted, marginBottom:5 }}>Senha</label>
+        <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" onKeyDown={e => e.key === 'Enter' && handleLogin()} style={{ ...inp, marginBottom:14 }} />
+        {error && <div style={{ color:C.red, fontSize:12, marginBottom:10, textAlign:'center' }}>{error}</div>}
+        <button onClick={handleLogin} disabled={loading}
+          style={{ background:loading ? '#334155' : C.gold, color:'#0d1526', border:'none', borderRadius:6, padding:'10px 20px', fontFamily:"'Bebas Neue',sans-serif", fontSize:16, letterSpacing:1.5, cursor:loading ? 'not-allowed' : 'pointer', width:'100%', transition:'.2s' }}>
+          {loading ? 'Verificando...' : 'Entrar'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+
+// ============================================================
+// app/admin/page.tsx
+// ============================================================
+'use client'
+import { useEffect } from 'react'
+import { useRouter } from 'next/navigation'
+import { useAuth } from '@/hooks/useAuth'
+import { useTeams } from '@/hooks/useTeams'
+import { usePlayers } from '@/hooks/usePlayers'
+import { useMatches } from '@/hooks/useMatches'
+import { useGoals } from '@/hooks/useGoals'
+import { useCards } from '@/hooks/useCards'
+import { useKnockout } from '@/hooks/useKnockout'
+import { calcStandings } from '@/lib/standings'
+import AdminPanel from '@/components/admin/AdminPanel'
+
+export default function AdminPage() {
+  const { isAdmin, loading: authLoading, signOut } = useAuth()
+  const router = useRouter()
+
+  useEffect(() => {
+    if (!authLoading && !isAdmin) router.push('/login')
+  }, [isAdmin, authLoading, router])
+
+  const { teams, addTeam, updateTeam, deleteTeam } = useTeams()
+  const { players, addPlayer, updatePlayer, deletePlayer } = usePlayers()
+  const { matches, addMatch, updateMatch, deleteMatch } = useMatches()
+  const { goals, addGoal, deleteGoal } = useGoals()
+  const { cards, addCard, deleteCard } = useCards()
+  const { knockout, setKnockout, updateKnockout } = useKnockout()
+
+  const stats = calcStandings(teams, matches)
+
+  if (authLoading || !isAdmin) return null
+
+  return (
+    <AdminPanel
+      db={{ teams, players, matches, goals, cards, knockout }}
+      stats={stats}
+      actions={{ addTeam, updateTeam, deleteTeam, addPlayer, updatePlayer, deletePlayer, addMatch, updateMatch, deleteMatch, addGoal, deleteGoal, addCard, deleteCard, setKnockout, updateKnockout }}
+      onLogout={async () => { await signOut(); router.push('/') }}
+    />
+  )
+}
+
+
+// ============================================================
+// app/page.tsx
+// ============================================================
+'use client'
+import { useTeams } from '@/hooks/useTeams'
+import { usePlayers } from '@/hooks/usePlayers'
+import { useMatches } from '@/hooks/useMatches'
+import { useGoals } from '@/hooks/useGoals'
+import { useCards } from '@/hooks/useCards'
+import { useKnockout } from '@/hooks/useKnockout'
+import { calcStandings } from '@/lib/standings'
+import PublicSite from '@/components/public/PublicSite'
+
+export default function HomePage() {
+  const { teams } = useTeams()
+  const { players } = usePlayers()
+  const { matches } = useMatches()
+  const { goals } = useGoals()
+  const { cards } = useCards()
+  const { knockout } = useKnockout()
+
+  const stats = calcStandings(teams, matches)
+
+  return (
+    <PublicSite
+      db={{ teams, players, matches, goals, cards, knockout }}
+      stats={stats}
+    />
+  )
+}
+
+
+// ============================================================
+// SQL — executar no Supabase SQL Editor
+// ============================================================
+/*
+create table public.teams (
+  id bigint generated always as identity primary key,
+  nome text not null, turma text, grupo int not null default 1,
+  foto_url text, descricao text, created_at timestamptz default now()
+);
+create table public.players (
+  id bigint generated always as identity primary key,
+  nome text not null, numero int default 0, posicao text,
+  time_id bigint references public.teams(id) on delete cascade,
+  foto_url text, created_at timestamptz default now()
+);
+create table public.matches (
+  id bigint generated always as identity primary key,
+  time_a bigint references public.teams(id),
+  time_b bigint references public.teams(id),
+  gols_a int, gols_b int, rodada int default 1,
+  data date, status text default 'agendada',
+  created_at timestamptz default now()
+);
+create table public.goals (
+  id bigint generated always as identity primary key,
+  match_id bigint references public.matches(id) on delete cascade,
+  player_id bigint references public.players(id) on delete cascade,
+  player_name text, minuto int default 0,
+  created_at timestamptz default now()
+);
+create table public.cards (
+  id bigint generated always as identity primary key,
+  match_id bigint references public.matches(id) on delete cascade,
+  player_id bigint references public.players(id) on delete cascade,
+  tipo text default 'amarelo', minuto int default 0,
+  created_at timestamptz default now()
+);
+create table public.knockout_matches (
+  id bigint generated always as identity primary key,
+  fase text not null, pos int default 1,
+  time_a bigint references public.teams(id),
+  time_b bigint references public.teams(id),
+  gols_a int, gols_b int,
+  vencedor bigint references public.teams(id),
+  created_at timestamptz default now()
+);
+
+alter table public.teams enable row level security;
+alter table public.players enable row level security;
+alter table public.matches enable row level security;
+alter table public.goals enable row level security;
+alter table public.cards enable row level security;
+alter table public.knockout_matches enable row level security;
+
+create policy "public read" on public.teams for select using (true);
+create policy "public read" on public.players for select using (true);
+create policy "public read" on public.matches for select using (true);
+create policy "public read" on public.goals for select using (true);
+create policy "public read" on public.cards for select using (true);
+create policy "public read" on public.knockout_matches for select using (true);
+
+create policy "auth write" on public.teams for all using (auth.role() = 'authenticated');
+create policy "auth write" on public.players for all using (auth.role() = 'authenticated');
+create policy "auth write" on public.matches for all using (auth.role() = 'authenticated');
+create policy "auth write" on public.goals for all using (auth.role() = 'authenticated');
+create policy "auth write" on public.cards for all using (auth.role() = 'authenticated');
+create policy "auth write" on public.knockout_matches for all using (auth.role() = 'authenticated');
+
+alter publication supabase_realtime add table public.teams;
+alter publication supabase_realtime add table public.players;
+alter publication supabase_realtime add table public.matches;
+alter publication supabase_realtime add table public.goals;
+alter publication supabase_realtime add table public.cards;
+alter publication supabase_realtime add table public.knockout_matches;
+*/
